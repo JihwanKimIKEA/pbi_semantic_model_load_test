@@ -12,7 +12,7 @@ It builds on [RunLoadTest / RunPerfScenario](../readme.md) (same ADOMD.NET repla
 | Artifacts | 2 notebooks | 1 notebook (virtual users are Python threads, each with its own connections) |
 | Replay | one query at a time, pause after every query | like a report page: the queries of one click run in parallel as captured; think time only between clicks |
 | Visual mapping | by event order | by the Performance Analyzer `parentId` chain (exact) |
-| Warm-up / cold start | - | warm-up pass excluded from statistics; first-touch time recorded |
+| Warm-up / cold start | - | warm-up pass excluded from statistics; first-touch time recorded; a model refreshed during the test is warmed up again (refresh guard) |
 | Result check | - | row count + order-independent checksum per query, and a **number check**: the report's measures × random business units × a 10-day window both models have loaded, with the likely cause of every difference |
 | Server cost | - | traced single-user pass: server duration, CPU, storage-engine queries |
 | Model diff | - | measures, calculation items, calculated columns, partitions, expressions, rows per table, capacity |
@@ -48,8 +48,40 @@ It builds on [RunLoadTest / RunPerfScenario](../readme.md) (same ADOMD.NET repla
 
 1. Set the parameters (Step 1) and *Run all* with `confirm_run = False`. This is a **dry run**: it connects, compares the models, runs the **number check** (Step 5: about 15 small single-user queries per model), lists the actions and estimates the duration. Nothing is saved, no load is generated, and no report is shown (Steps 8 and 10 say "dry run only").
 2. After approval to load the production model, set `confirm_run = True` and *Run all*.
-3. For long runs (large think times or many iterations), run the notebook from a **pipeline or schedule** with the same parameters, so the browser doesn't need to stay open. Results are saved after every round, so an interrupted run can still be reported.
+3. For long runs (large think times or many iterations), run the notebook from a **pipeline or schedule** with the same parameters, so the browser doesn't need to stay open. Results are saved after every round, so an interrupted run can still be reported. See [Scheduled (unattended) runs](#scheduled-unattended-runs).
 4. To open a past comparison, set `report_comparison_id` and run Steps 1, 2 and 8 (and 10 for the plain-text summary). Step 9 lists every saved comparison in one table.
+
+### Scheduled (unattended) runs
+
+**You don't need a dry run to get a warm comparison.** A real run (`confirm_run = True`) warms both models itself before measuring anything:
+
+| Step | What runs | Counts in the statistics? |
+|---|---|---|
+| 3 Preflight | Connect + `EVALUATE {1}` per model (*first touch*; loads a model that was evicted) | Shown as "cold first touch" only |
+| 4 Warm-up | Every replayed query once on A, then on B (pages in every column the replay uses, fills the caches) | Shown as "first run" only |
+| 6 Server cost | Traced single-user pass, A,B / B,A | Yes (server CPU / duration) |
+| 7 Load test | Rounds A,B / B,A | Yes (latency, wait per click) |
+
+A dry run only does the first touch and the small number-check queries, a subset of Step 4. Without a dry run, only the two single measurements "cold first touch" and "first run" change: they then show the real state at the scheduled time, which is what they are meant to show. The dry run is still the right way to check new parameters or a new query file before you schedule them.
+
+**Set it up with a pipeline** (keeps the notebook safe for interactive use):
+
+1. Keep `confirm_run = False` saved in the notebook, so *Run all* in the browser stays a dry run. The notebook's own *Schedule* runs with the saved values; to pass `confirm_run = True` only to the scheduled run, use a pipeline.
+2. Create a **Data pipeline**, add a **Notebook** activity and select `ModelCompare_LoadTest`.
+3. *Settings* > *Base parameters*: add `confirm_run`, type **Bool**, value `true`. Add any other parameter you want to override for the scheduled run (same names as in Step 1).
+4. *General* > *Timeout*: longer than the TOTAL estimate that preflight prints, plus margin (queries are slower under load, and a re-warm adds a single-user pass).
+5. *Home* > *Schedule*: pick a start time when neither model is refreshed for the estimated duration. Check both models' refresh schedules, and for Direct Lake models whether *Keep your Direct Lake data up to date* (automatic updates) reframes the model while ETL jobs write the tables at night.
+6. Afterwards, open the result with Step 9 (History) and `report_comparison_id` + Steps 1, 2, 8 and 10.
+
+On/off parameters accept `True`/`False`, `0`/`1` or the text `true`/`false`/`yes`/`no` (any case). Any other value stops the run in preflight, so a value like `"false"` passed as text can never start a real test.
+
+**Refresh guard** (`rewarm_after_refresh = True`, needs `run_warmup = True`): a refresh or Direct Lake reframe clears a model's caches, which would make the comparison unfair. The notebook reads each model's last refresh time after the warm-up, before and after the server-cost pass, and before and after every load round:
+
+- Refreshed since its last warm-up → the model is warmed up again (phase `rewarm`, not in the statistics) before the next measurement.
+- Refreshed while a load round of that model ran → that round is stored as `load_discarded` (not in the statistics), the model is warmed up again, and the round is repeated with the same round number. After 2 repeats the last attempt is kept, and the report flags the refresh.
+- Refreshed during the server-cost pass → the model is warmed up again; the report warns that its server cost may include cold queries (the pass isn't repeated).
+
+Each event is stored in `lt_model_profile` (`item_type = refresh_guard`) and listed in Step 10. A refresh the guard handled is a data-quality note in the report, not a warning.
 
 ### Finding the results
 
@@ -97,7 +129,8 @@ The notebook has 10 steps. Each step is a heading followed by one code cell. In 
 | `number_check_bu_column`, `number_check_date_column` | `""` | `""` = auto-detect; or e.g. `"'Business Unit'[Business Unit]"`, `"'Date'[Date]"` |
 | `run_server_trace` | `True` | Traced single-user pass per model |
 | `run_load_test` | `True` | Concurrent load phase |
-| `confirm_run` | `False` | Safety switch: `False` = dry run (checks + number check, nothing saved, no report); `True` = run and save a new test |
+| `rewarm_after_refresh` | `True` | Refresh guard: re-warm a model refreshed during the test and repeat the load round it overlapped (see [Scheduled (unattended) runs](#scheduled-unattended-runs)). Needs `run_warmup = True` |
+| `confirm_run` | `False` | Safety switch: `False` = dry run (checks + number check, nothing saved, no report); `True` = run and save a new test. From a pipeline, pass it as type Bool |
 | `max_concurrency_guard` | `5` | Refuses concurrency levels (virtual users) above this value |
 | `max_concurrent_queries_guard` | `15` | Refuses a run whose peak concurrent queries per model (virtual users × the largest parallelism of a click) exceeds this value |
 | `noise_band_pct` | `5` | Changes within ±5% are shown as "no meaningful change" |
@@ -129,8 +162,10 @@ The think time between clicks dominates the duration: one click-through takes ab
    - Traces both models **at the same time** during one single-user pass, with queries alternating A,B / B,A. Both models are therefore measured at the same moment and at the same distance from their warm-up, so neither gets a cache advantage.
    - Only this notebook's sessions are matched, so other users' queries are ignored and never stored.
    - Only the notebook's own traces are dropped afterwards.
+   - With the refresh guard, a model refreshed since its warm-up is warmed up again first; a refresh during the pass is reported.
 - **Step 7 - Load test**:
    - For each level and iteration, rounds alternate A,B → B,A → A,B. This cancels time-of-day and capacity drift.
+   - With the refresh guard, a model refreshed before its round is warmed up again, and a round that overlapped a refresh of its model is discarded and repeated (at most 2 repeats).
    - Each virtual user clicks through the report: the queries of one click run in parallel up to the click's captured parallelism, each parallel slot on its own connection; then it waits `think_time_between_actions_sec` before the next click.
    - Peak concurrent queries per model = virtual users × the largest parallelism; preflight prints it and refuses runs above `max_concurrent_queries_guard`.
    - Connections are (re)opened between clicks, with a fresh token before tokens expire, so connecting never counts as waiting time.
@@ -145,7 +180,7 @@ The report has a short main view for decision makers (the executive summary and 
 - **Executive summary**. It is built only from the stored results, so it adapts to any pair of models, and it states facts only (no merge decision):
   - **Context**: test time, capacity, load, replay mode, and the data freshness of both models ("Prod refreshed …; Branch refreshed … (n days older)").
   - **Blockers** (red, only when something applies): numbers that differ under the controlled filter (up to 5 measures with values, where and cause), queries that fail only in B, an incomplete run.
-  - **Warnings** (amber): different capacities, a model refreshed during the test.
+  - **Warnings** (amber): different capacities, a model refreshed during the test that the refresh guard couldn't handle, a refresh during the server-cost pass.
   - **Bottom line**: speed for users, capacity use (server CPU), the number check, and failures; then the plain-language KPIs: slowest 10% of visuals, slowest single visual, typical visual, one full click-through, server CPU (drives CU usage) and failed queries. Changes read like "about 2.1× faster (−52%)"; changes smaller than 100 ms are marked "not noticeable to users".
   - **Pros** (B better) and **Cons** (B worse): only changes that are statistically clear at 95% confidence, with A → B and the 95% range; clearly faster / slower clicks; fewer / more failures. Then which changes are **not statistically clear** (the change is larger than the noise band, but its 95% range includes no change) or **no meaningful change** (within the noise band), and where the server CPU difference comes from.
   - **Trade-offs and risks**: speed vs capacity pulling in opposite directions, changed logic (measures, calculation items, calculated columns) with its number-check outcome, whole-query result differences in the light of the number check, different data volume, different data source or parameters.
@@ -167,7 +202,7 @@ The report has a short main view for decision makers (the executive summary and 
   - *Change*: for example "about 5.1× slower (+413%)", "about the same (−2%)" (within the noise band), or "no clear difference (−21%)" (the gap is small compared with how much the runs varied, so it may be chance). Failed runs are added, e.g. "failed 3× in Branch".
   - *Same numbers?*: whether both models returned the same result for the whole query (Step 4).
 - **Errors** (if any).
-- **Data-quality notes**: few samples, incomplete trace, cold start, capacity, last refresh time per model (and a warning if a model was refreshed during the test), interrupted run.
+- **Data-quality notes**: few samples, incomplete trace, cold start, capacity, last refresh time per model (and a note if a model was refreshed during the test: handled by the refresh guard, or a warning when it wasn't), interrupted run.
 
 Comparisons saved before the page-load replay existed are shown with their original meaning: the click wait is the sum of the click's query times (sequential replay), and the number check is "not available".
 
@@ -183,8 +218,8 @@ Click-based metrics only use queries that succeeded in both models; the number o
 |---|---|
 | `lt_comparison` | One row per status change of a run (latest row wins): parameters, models, query file hash, status |
 | `lt_query_catalog` | Run × query: action, visual, captured timing, query text |
-| `lt_model_profile` | Run × model × item: first touch, object counts, storage modes, definition hashes, rows per table, capacity, last refresh (at start and end), and the number check (below) |
-| `lt_executions` | Every query execution (phase `warmup` / `trace` / `load`), timing, rows, checksum, error |
+| `lt_model_profile` | Run × model × item: first touch, object counts, storage modes, definition hashes, rows per table, capacity, last refresh (at start and end), refresh-guard events (`refresh_guard`: `item_name` = when, e.g. `before round 4` / `during round 4: repeated`, or `check failed` when a refresh time couldn't be read, after which refreshes of that model count as not handled; `value_text` = the refresh time; `value_num` = round), and the number check (below) |
+| `lt_executions` | Every query execution (phase `warmup` / `trace` / `load`, plus `rewarm` / `load_discarded` from the refresh guard), timing, rows, checksum, error. The statistics use `load` (and `warmup` for the first run) only |
 | `lt_server_metrics` | Run × model × query: server duration, CPU, storage-engine queries / CPU / cache matches |
 | `lt_result_compare` | Run × query: rows and checksum A vs B |
 
@@ -211,7 +246,7 @@ The number check is stored in `lt_model_profile` with these `item_type` values (
 - **Fairness**: both workspaces should be on the same capacity; preflight checks this. If B uses a different data source or volume, the speed and cost deltas combine the definition changes and the data difference. The report shows both but doesn't attribute the cause.
 - **Number check**: it removes refresh-timing noise only inside the window. Data corrected in place in Prod after the Branch was refreshed, measures that use `TODAY()`/`NOW()`, calculation groups with a default selection, and measures that exist in one model only can still differ, and are reported with that fact. With a different business-unit or date column, or when detection fails, set the override parameters.
 - **Cold vs warm**: no cache clearing or forced cold state is used, to avoid hurting production users. Cold behaviour is visible through first touch and the warm-up first run.
-- **Refreshes and caches**: a refresh or Direct Lake reframe clears a model's caches. The notebook records each model's last refresh time at the start and the end, and the report flags a model that was refreshed during the test. Repeated identical queries can be served from the engine's cache, so a DAX change that makes queries cache-friendly can look dramatically faster on repeats. Compare the warm-up (first run) numbers with the load-test numbers to see both effects.
+- **Refreshes and caches**: a refresh or Direct Lake reframe clears a model's caches. The notebook records each model's last refresh time at the start and the end, and the refresh guard (`rewarm_after_refresh`) re-warms a refreshed model and repeats the load round it overlapped. A refresh is detected when it commits: an Import refresh that is still processing uses capacity CPU but isn't detected until then, so schedule tests outside refresh windows. Repeated identical queries can be served from the engine's cache, so a DAX change that makes queries cache-friendly can look dramatically faster on repeats. Compare the warm-up (first run) numbers with the load-test numbers to see both effects.
 - **Trace**: `sempy` traces are best-effort. If events are incomplete, the run is flagged in the data-quality notes rather than failed.
 - **Checksums**: rows are compared order-independently after rounding floats (`checksum_float_decimals`). A difference is information, not an error.
 - **Client sizing**: the default Python notebook (2 vCores) handles the default levels. Preflight suggests a `%%configure` cell (`{"vCores": 8}`) at the top when the peak concurrent queries exceed 20.

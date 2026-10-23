@@ -18,7 +18,7 @@
 # 4. **Warm-up + result comparison**: every query once per model (first-run latency, row count, result checksum), then rows per table.
 # 5. **Number check**: the measures the report uses, compared in both models under a controlled filter (a few random business units, a 10-day window both models have loaded), so refresh timing can't explain a difference. A difference is flagged as CRITICAL with its likely cause; the run continues. Also runs in the dry run.
 # 6. **Server cost**: both models are traced at the same time while the queries alternate A,B / B,A (single user, best effort), so both are measured under the same conditions: server duration and CPU per query.
-# 7. **Load test**: for every concurrency level and iteration, alternating rounds A,B -> B,A -> ...; each virtual user clicks through the report like a person: the queries of one click run in parallel as captured, with a think time between clicks.
+# 7. **Load test**: for every concurrency level and iteration, alternating rounds A,B -> B,A -> ...; each virtual user clicks through the report like a person: the queries of one click run in parallel as captured, with a think time between clicks. With `rewarm_after_refresh = True`, a model refreshed during the test is warmed up again and a round that overlapped the refresh is repeated.
 # 8. **Report**: starts with an **executive summary** for decision makers (blockers, bottom line, pros, cons, trade-offs, questions, next steps, copy-as-text), then one chart: how long a user waits after each click. Everything else (number check, scorecard, top visuals, server CPU per query, a plain per-visual table, errors, data-quality notes) is in one collapsed **Details for analysts** section.
 # 9. **History**: a table of all saved comparisons (one row each, including the query file).
 # 10. **Text summary**: the exact numbers as plain text, for sharing.
@@ -29,6 +29,7 @@
 # 3. You need Read + Build (XMLA read) on both models; the server-cost trace may need Contributor (or higher) on both workspaces.
 #
 # **Run**: set the parameters, *Run all* with `confirm_run = False` (dry run: checks the settings, runs the number check and estimates the duration; nothing is saved, no load is generated and no report is shown), review, set `confirm_run = True`, *Run all*.
+# **Scheduled run** (e.g. at night): no dry run is needed to warm the models, because Step 4 warms both models before anything is measured. Keep `confirm_run = False` saved here and run the notebook from a pipeline *Notebook* activity with the base parameter `confirm_run` = `true` (type Bool), then schedule the pipeline. See the README.
 # To open a past comparison later: set `report_comparison_id` and run Steps 1, 2 and 8 (and optionally 10).
 
 # ==============================================================================
@@ -72,6 +73,7 @@ checksum_float_decimals = 6         # rounding before checksum (avoids false "di
 run_number_check = True             # Step 5: numbers under a controlled filter (also runs in the dry run)
 run_server_trace = True             # Step 6: traced single-user pass per model (server duration + CPU)
 run_load_test = True                # Step 7: load test
+rewarm_after_refresh = True         # Steps 6-7: re-warm a model refreshed during the test; repeat the load round it overlapped
 
 # ---- Number check (Step 5) -------------------------------------------------------
 number_check_bu_count = 3           # random business units, chosen from those with data in the window in both models
@@ -137,11 +139,14 @@ PARAM_NAMES = [
     "host_workspace", "lakehouse_name", "query_file", "include_user_actions", "concurrency_levels",
     "iterations", "think_time_between_actions_sec",
     "cooldown_between_rounds_sec", "ramp_up_sec", "query_timeout_sec", "run_warmup", "compare_results",
-    "checksum_float_decimals", "run_number_check", "run_server_trace", "run_load_test",
+    "checksum_float_decimals", "run_number_check", "run_server_trace", "run_load_test", "rewarm_after_refresh",
     "number_check_bu_count", "number_check_days", "number_check_tolerance_pct", "number_check_seed",
     "number_check_bu_column", "number_check_date_column", "confirm_run", "max_concurrency_guard",
     "max_concurrent_queries_guard", "noise_band_pct", "top_n_queries", "app_name",
 ]
+BOOL_PARAMS = ("confirm_run", "run_warmup", "compare_results", "run_number_check", "run_server_trace", "run_load_test",
+               "rewarm_after_refresh")
+MAX_ROUND_REPEATS = 2                # a load round that overlapped a refresh is repeated at most this often
 XMLA_PREFIX = "powerbi://api.powerbi.com/v1.0/myorg/"
 RECONNECT_AFTER_SEC = 40 * 60        # reconnect (fresh token) before access tokens expire
 PROGRESS_EVERY_SEC = 60
@@ -174,6 +179,18 @@ def _parse_list(value):
 
 def _parse_int_list(value):
     return [int(t) for t in _parse_list(value)]
+
+
+def _as_bool(value):
+    """True / False from a bool, 0 / 1 or the text true/false/yes/no/1/0 (as a pipeline or the API may pass it);
+    None when the value is none of these. bool("false") would be True, so on/off parameters go through this."""
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, float, np.integer, np.floating)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        return {"true": True, "yes": True, "1": True, "false": False, "no": False, "0": False}.get(value.strip().lower())
+    return None
 
 
 def _slug(text):
@@ -785,6 +802,82 @@ def last_refresh_utc(con):
         return None
 
 
+def warm_pass(model_key, phase="warmup", want_checksum=False):
+    """Every replayed query once on one model, single user: the warm-up, or a re-warm after a refresh. Returns the records."""
+    con, recs = open_connection(model_key), []
+    try:
+        for q in QUERIES:
+            r = run_query(con, q["text"], want_checksum=want_checksum)
+            recs.append(exec_record(phase, model_key, q, r))
+            if not r["success"]:
+                _safe_close(con)
+                con = open_connection(model_key)
+    finally:
+        _safe_close(con)
+    return recs
+
+
+# ---------- Refresh guard ----------
+# A refresh / Direct Lake reframe clears a model's caches. With rewarm_after_refresh, the notebook reads each model's last
+# refresh time between the measured steps; when it changed, the model is warmed up again (phase "rewarm") and a load round
+# that overlapped the refresh is stored as "load_discarded" and repeated. Events go to lt_model_profile ("refresh_guard").
+def current_refresh_utc(model_key):
+    con = None
+    try:
+        con = open_connection(model_key)
+        return last_refresh_utc(con)
+    except Exception:
+        return None
+    finally:
+        _safe_close(con)
+
+
+def refresh_since_warm(model_key):
+    """The new last-refresh time when the model was refreshed since it was last warmed up, else None (also when unknown)."""
+    if not REFRESH_GUARD:
+        return None
+    now = current_refresh_utc(model_key)
+    if now is None:
+        if REFRESH_SEEN.get(model_key) is not None and model_key not in GUARD_GAPS:
+            GUARD_GAPS.add(model_key)   # a refresh may go unnoticed now, so the report won't count refreshes as handled
+            guard_event(model_key, "check failed", None)
+        return None
+    if REFRESH_SEEN.get(model_key) is None:   # unknown at preflight: nothing to compare with
+        REFRESH_SEEN[model_key] = now
+        return None
+    return now if now != REFRESH_SEEN[model_key] else None
+
+
+def guard_event(model_key, event, refreshed_utc, round_no=0):
+    write_table(pd.DataFrame([{"comparison_id": COMPARISON_ID, "model_key": model_key,
+                               "model_label": MODELS[model_key]["label"], "item_type": "refresh_guard",
+                               "item_name": event, "value_num": float(round_no), "value_text": refreshed_utc,
+                               "captured_utc": utcnow()}]), "lt_model_profile")
+
+
+def rewarm(model_key, where, refreshed_utc, round_no=0, event=None):
+    """Warm a refreshed model up again (phase 'rewarm', not in the statistics) and store the event (default: where)."""
+    print(f"  REFRESH GUARD: {MODELS[model_key]['label']} was refreshed / reframed {where} (last refresh "
+          f"{refreshed_utc} UTC). Warming it up again ...")
+    t0 = time.perf_counter()
+    recs = warm_pass(model_key, "rewarm")
+    for r in recs:
+        r["round_no"] = round_no
+    write_table(pd.DataFrame(recs), "lt_executions")
+    REFRESH_SEEN[model_key] = refreshed_utc
+    guard_event(model_key, event or where, refreshed_utc, round_no)
+    print(f"  re-warm done: errors {sum(not r['success'] for r in recs)} | took {fmt_hms(time.perf_counter() - t0)}")
+
+
+def rewarm_if_refreshed(model_key, where, round_no=0):
+    """Re-warm the model when it was refreshed since its last warm-up. Returns True when it did."""
+    new = refresh_since_warm(model_key)
+    if new is None:
+        return False
+    rewarm(model_key, where, new, round_no)
+    return True
+
+
 def collect_table_rows(con, model_key):
     label, now, rows = MODELS[model_key]["label"], utcnow(), []
     tables = query_df(con, 'EVALUATE SELECTCOLUMNS(INFO.TABLES(), "TName", [Name], "CG", [CalculationGroupID])')
@@ -898,7 +991,9 @@ def table_row_diffs(prof):
 
 
 def refresh_info(prof):
-    """Last refresh / Direct Lake framing per model at preflight and at the end; which models refreshed during the test."""
+    """Last refresh / Direct Lake framing per model at preflight and at the end; which models refreshed during the test.
+    'handled': refreshed, but the refresh guard caught every refresh (its 'at end' time is a guard event) and no round had to
+    be kept after the repeat limit. Comparisons made before the guard existed have no guard events."""
     lr = prof[prof["item_type"] == "last_refresh_utc"] if len(prof) else prof
 
     def one(k, when):
@@ -907,7 +1002,20 @@ def refresh_info(prof):
 
     info = {k: {"before": one(k, "at preflight"), "after": one(k, "at end")} for k in "AB"}
     refreshed = [k for k in "AB" if info[k]["before"] and info[k]["after"] and info[k]["before"] != info[k]["after"]]
-    return {"by_model": info, "refreshed": refreshed, "known": len(lr) > 0 and bool((lr["item_name"] == "at end").any())}
+    g = prof[prof["item_type"] == "refresh_guard"] if len(prof) else prof
+    guard = {}
+    for k in "AB":
+        gk = g[g["model_key"] == k] if len(g) else g
+        events = [str(e) for e in gk["item_name"]] if len(gk) else []
+        times = {str(v) for v in gk["value_text"] if not _isnan(v)} if len(gk) else set()
+        guard[k] = {"repeated": sum(e.endswith(": repeated") for e in events),
+                    "kept": [0 if _isnan(r) else int(r) for r, e in zip(gk["value_num"], events)
+                             if e.endswith("(repeat limit)")] if len(gk) else [],
+                    "in_warmup": "during warm-up" in events, "in_trace": "during server trace" in events,
+                    "gap": "check failed" in events, "covers_end": info[k]["after"] in times}
+    handled = [k for k in refreshed if guard[k]["covers_end"] and not guard[k]["kept"] and not guard[k]["gap"]]
+    return {"by_model": info, "refreshed": [k for k in refreshed if k not in handled], "handled": handled, "guard": guard,
+            "known": len(lr) > 0 and bool((lr["item_name"] == "at end").any())}
 
 
 def capacity_info(prof):
@@ -1264,8 +1372,15 @@ print(f"Setup OK. Results lakehouse: {lakehouse_name} ({LAKEHOUSE_ROOT})")
 banner("STEP 3 - PREFLIGHT")
 
 # ---- 1. Parameters ----
-CONCURRENCY = _parse_int_list(concurrency_levels)
 _problems = []
+globals().setdefault("rewarm_after_refresh", True)   # parameter cells copied from older versions don't have it
+for _name in BOOL_PARAMS:
+    _v = _as_bool(globals()[_name])
+    if _v is None:
+        _problems.append(f"{_name} must be True or False (got {globals()[_name]!r}).")
+    else:
+        globals()[_name] = _v
+CONCURRENCY = _parse_int_list(concurrency_levels)
 if not CONCURRENCY or any(c < 1 for c in CONCURRENCY):
     _problems.append("concurrency_levels must be positive integers, e.g. '1,3,5'.")
 if int(iterations) < 1:
@@ -1361,6 +1476,11 @@ for _mk in ("A", "B"):
     _cold = "  <- slow: the model was probably cold (evicted) and had to load" if FIRST_TOUCH_MS[_mk] > 5000 else ""
     print(f"  {MODELS[_mk]['label']:<10} first touch: {fmt_ms(FIRST_TOUCH_MS[_mk])}{_cold}")
 PROFILE_DF = pd.DataFrame(_profile_rows)
+_lr = PROFILE_DF[PROFILE_DF["item_type"] == "last_refresh_utc"]
+REFRESH_SEEN = {_mk: next((v for v in _lr.loc[_lr["model_key"] == _mk, "value_text"] if not _isnan(v)), None)
+                for _mk in ("A", "B")}   # last refresh each model was warmed up after (refresh guard baseline)
+REFRESH_GUARD = bool(rewarm_after_refresh) and bool(run_warmup)
+GUARD_GAPS = set()   # models whose refresh time couldn't be read at some check
 
 # Fair comparison needs both workspaces on the same capacity.
 CAPACITY = {}
@@ -1425,6 +1545,14 @@ print("  estimated duration (captured Desktop timings + think times; queries get
 for _k, _v in _est.items():
     print(f"    {_k:<42} ~ {fmt_hms(_v)}")
 print(f"    {'TOTAL':<42} ~ {fmt_hms(sum(_est.values()))}")
+if REFRESH_GUARD:
+    _unknown = [MODELS[k]["label"] for k in ("A", "B") if REFRESH_SEEN[k] is None]
+    print("  refresh guard: on. A model refreshed / reframed during the test is warmed up again (adds one single-user pass) "
+          "and a load round that overlapped the refresh is repeated."
+          + (f" Last refresh time unknown for {_join_list(_unknown)}: not guarded until it can be read." if _unknown else ""))
+else:
+    print(f"  refresh guard: off ({'rewarm_after_refresh' if not rewarm_after_refresh else 'run_warmup'} = False). "
+          "A refresh during the test is only flagged in the report.")
 if sum(_est.values()) > 4 * 3600:
     print("  Tip: long run. Consider running this notebook from a pipeline / schedule, or lower the think times.")
 
@@ -1460,14 +1588,7 @@ else:
                 print(f"\n{MODELS[_mk]['label']}: every query once, single user (first-run latency"
                       f"{' + result checksum' if compare_results else ''}) ...")
                 _t0 = time.perf_counter()
-                _con, _recs = open_connection(_mk), []
-                for _q in QUERIES:
-                    _r = run_query(_con, _q["text"], want_checksum=bool(compare_results))
-                    _recs.append(exec_record("warmup", _mk, _q, _r))
-                    if not _r["success"]:
-                        _safe_close(_con)
-                        _con = open_connection(_mk)
-                _safe_close(_con)
+                _recs = warm_pass(_mk, "warmup", want_checksum=bool(compare_results))
                 WARMUP[_mk] = pd.DataFrame(_recs)
                 write_table(WARMUP[_mk], "lt_executions")
                 print(f"  first query {fmt_ms(_recs[0]['duration_ms'])} | total query time "
@@ -1504,6 +1625,8 @@ else:
                 } for r in _diff.itertuples()]).astype({f"rows {a_label}": "Int64", f"rows {b_label}": "Int64"}))
                 print("These whole-query results also cover dates the Branch snapshot may not have loaded yet. "
                       "Step 5 compares the numbers under a controlled filter, where refresh timing can't explain a difference.")
+            for _mk in ("A", "B"):
+                rewarm_if_refreshed(_mk, "during warm-up")
         else:
             print("Warm-up disabled (run_warmup = False). Note: cold-start effects will then be part of the load statistics.")
 
@@ -2341,6 +2464,8 @@ elif not run_server_trace:
     print("Skipped: run_server_trace = False.")
 else:
     try:
+        for _mk in ("A", "B"):
+            rewarm_if_refreshed(_mk, "before server trace")
         SERVER_ROWS = []
         _schema = _trace_schema()
         # Both traces run at the same time and the queries alternate A,B / B,A, so both models are measured
@@ -2399,6 +2524,9 @@ else:
                 print(f"  {MODELS[_mk]['label']:<10} matched server events for {_matched}/{len(_s['executed'])} queries | "
                       f"server duration {fmt_ms(_dur)} | server CPU {fmt_ms(_cpu)}")
         write_table(pd.DataFrame(SERVER_ROWS), "lt_server_metrics")
+        for _mk in ("A", "B"):
+            if rewarm_if_refreshed(_mk, "during server trace"):
+                print(f"  The server cost of {MODELS[_mk]['label']} above may include queries that ran after the refresh (cold).")
         write_status("running", "server-cost pass done")
     except BaseException as _exc:
         write_status("failed", f"server trace: {_err_text(_exc)}")
@@ -2493,15 +2621,19 @@ def _virtual_user(model_key, user_id, concurrency, round_no, iteration, start_at
 
 
 def _record_refresh_at_end():
-    """Store each model's last refresh time again; the report flags models refreshed during the test."""
+    """Store each model's last refresh time again; the report flags models refreshed during the test. With the refresh
+    guard, a refresh after a model's last guarded measurement is logged as such (nothing of that model ran after it)."""
     rows = []
     for mk in ("A", "B"):
         con = None
         try:
             con = open_connection(mk)
+            v = last_refresh_utc(con)
             rows.append({"comparison_id": COMPARISON_ID, "model_key": mk, "model_label": MODELS[mk]["label"],
-                         "item_type": "last_refresh_utc", "item_name": "at end", "value_text": last_refresh_utc(con),
+                         "item_type": "last_refresh_utc", "item_name": "at end", "value_text": v,
                          "captured_utc": utcnow()})
+            if REFRESH_GUARD and v and REFRESH_SEEN.get(mk) and v != REFRESH_SEEN[mk] and mk not in GUARD_GAPS:
+                guard_event(mk, "after the last measurement", v)
         except Exception as exc:
             print(f"  (could not read the last refresh time of {MODELS[mk]['label']}: {_err_text(exc)[:150]})")
         finally:
@@ -2527,36 +2659,55 @@ else:
     _t_test, _total_err, _sink, _threads, _sink_saved = time.time(), 0, [], [], True
     try:
         for _rp in ROUND_PLAN:
-            _mk, _c = _rp["model_key"], _rp["concurrency"]
-            _sink, _progress, _lock, _sink_saved = [], {"done": 0, "errors": 0}, threading.Lock(), False
-            _expected = _c * len(QUERIES)
-            print(f"\nRound {_rp['round_no']}/{len(ROUND_PLAN)} | {MODELS[_mk]['label']} | {_c} virtual user(s) | "
-                  f"iteration {_rp['iteration']}/{iterations} | started {utcnow():%H:%M:%S} UTC")
-            _start_at = time.time() + 2
-            _threads = [threading.Thread(target=_virtual_user, daemon=True,
-                                         args=(_mk, _u, _c, _rp["round_no"], _rp["iteration"],
-                                               _start_at + (_u - 1) * float(ramp_up_sec), _sink, _progress, _lock))
-                        for _u in range(1, _c + 1)]
-            _t0 = _last = time.time()
-            for _t in _threads:
-                _t.start()
-            while any(_t.is_alive() for _t in _threads):
-                time.sleep(2)
-                if time.time() - _last >= PROGRESS_EVERY_SEC:
-                    _last = time.time()
-                    print(f"    ... {_progress['done']}/{_expected} queries, errors {_progress['errors']}, "
-                          f"elapsed {fmt_hms(_last - _t0)}")
-            _df = pd.DataFrame(_sink)
-            write_table(_df, "lt_executions")
-            _sink_saved = True
-            _ok = _df[_df["success"] == True] if len(_df) else _df  # noqa: E712
-            _err = len(_df) - len(_ok)
-            _total_err += _err
-            _cw = click_waits(_ok[_ok["query_seq"] > 0], "page_load") if len(_ok) else None
-            print(f"  done: {len(_ok)}/{_expected} ok, errors {_err} | query median {fmt_ms(pctl(_ok.get('duration_ms', []), 50))} | "
-                  f"p90 {fmt_ms(pctl(_ok.get('duration_ms', []), 90))} | median wait per click "
-                  f"{fmt_ms(pctl(_cw['wait_ms'], 50) if _cw is not None else float('nan'))} | took {fmt_hms(time.time() - _t0)}")
-            if _rp["round_no"] < len(ROUND_PLAN) and float(cooldown_between_rounds_sec) > 0:
+            _mk, _c, _rn = _rp["model_key"], _rp["concurrency"], _rp["round_no"]
+            _repeat = 0
+            while True:
+                rewarm_if_refreshed(_mk, f"before round {_rn}", _rn)
+                _sink, _progress, _lock, _sink_saved = [], {"done": 0, "errors": 0}, threading.Lock(), False
+                _expected = _c * len(QUERIES)
+                print(f"\nRound {_rn}/{len(ROUND_PLAN)}{f' (repeat {_repeat})' if _repeat else ''} | {MODELS[_mk]['label']} | "
+                      f"{_c} virtual user(s) | iteration {_rp['iteration']}/{iterations} | started {utcnow():%H:%M:%S} UTC")
+                _start_at = time.time() + 2
+                _threads = [threading.Thread(target=_virtual_user, daemon=True,
+                                             args=(_mk, _u, _c, _rn, _rp["iteration"],
+                                                   _start_at + (_u - 1) * float(ramp_up_sec), _sink, _progress, _lock))
+                            for _u in range(1, _c + 1)]
+                _t0 = _last = time.time()
+                for _t in _threads:
+                    _t.start()
+                while any(_t.is_alive() for _t in _threads):
+                    time.sleep(2)
+                    if time.time() - _last >= PROGRESS_EVERY_SEC:
+                        _last = time.time()
+                        print(f"    ... {_progress['done']}/{_expected} queries, errors {_progress['errors']}, "
+                              f"elapsed {fmt_hms(_last - _t0)}")
+                _df = pd.DataFrame(_sink)
+                _new = refresh_since_warm(_mk)   # refreshed / reframed while this round ran?
+                _redo = _new is not None and _repeat < MAX_ROUND_REPEATS
+                if _redo and len(_df):
+                    _df["phase"] = "load_discarded"
+                write_table(_df, "lt_executions")
+                _sink_saved = True
+                _ok = _df[_df["success"] == True] if len(_df) else _df  # noqa: E712
+                _err = len(_df) - len(_ok)
+                if not _redo:
+                    _total_err += _err
+                _cw = click_waits(_ok[_ok["query_seq"] > 0], "page_load") if len(_ok) else None
+                print(f"  done: {len(_ok)}/{_expected} ok, errors {_err} | query median {fmt_ms(pctl(_ok.get('duration_ms', []), 50))} | "
+                      f"p90 {fmt_ms(pctl(_ok.get('duration_ms', []), 90))} | median wait per click "
+                      f"{fmt_ms(pctl(_cw['wait_ms'], 50) if _cw is not None else float('nan'))} | took {fmt_hms(time.time() - _t0)}")
+                if _new is None:
+                    break
+                if _redo:
+                    print("  This round overlapped a refresh: stored as 'load_discarded' (not in the statistics) and repeated.")
+                    _repeat += 1
+                    rewarm(_mk, f"during round {_rn}", _new, _rn, event=f"during round {_rn}: repeated")
+                    continue
+                print(f"  This round overlapped a refresh again; after {MAX_ROUND_REPEATS} repeats it is kept "
+                      "(the report flags the refresh).")
+                rewarm(_mk, f"during round {_rn}", _new, _rn, event=f"during round {_rn}: kept (repeat limit)")
+                break
+            if _rn < len(ROUND_PLAN) and float(cooldown_between_rounds_sec) > 0:
                 time.sleep(float(cooldown_between_rounds_sec))
         _record_refresh_at_end()
         write_status("completed", f"load test done in {fmt_hms(time.time() - _t_test)}; errors {_total_err}")
@@ -3036,6 +3187,10 @@ def summary_sections(M):
     if M["refresh"]["refreshed"]:
         warnings.append(f"{_join_list([LBL[k] for k in M['refresh']['refreshed']])} refreshed during the test; part of its "
                         "queries ran with cleared caches.")
+    trace_hit = [k for k in M["refresh"]["handled"] if M["refresh"]["guard"][k]["in_trace"]]
+    if trace_hit:
+        warnings.append(f"{_join_list([LBL[k] for k in trace_hit])} refreshed during the server-cost pass; its server "
+                        "CPU and duration may include queries that ran with cleared caches.")
 
     # ---- context ----
     t0, t1, levels = M["t0"], M["t1"], M["levels"]
@@ -3046,8 +3201,13 @@ def summary_sections(M):
                f"{M['n_q']} recorded report queries",
                "page-load replay" if page else "sequential replay"]
     if M["refresh"]["known"]:
-        context.append("no refresh during the test" if not M["refresh"]["refreshed"]
-                       else f"{_join_list([LBL[k] for k in M['refresh']['refreshed']])} refreshed during the test")
+        rf_unhandled, rf_handled = M["refresh"]["refreshed"], M["refresh"]["handled"]
+        if not rf_unhandled and not rf_handled:
+            context.append("no refresh during the test")
+        if rf_unhandled:
+            context.append(f"{_join_list([LBL[k] for k in rf_unhandled])} refreshed during the test")
+        if rf_handled:
+            context.append(f"{_join_list([LBL[k] for k in rf_handled])} refreshed during the test (re-warmed by the refresh guard)")
     fresh = _freshness(M)
 
     # ---- bottom line ----
@@ -3342,8 +3502,22 @@ def data_quality_notes(M):
                       + ". A refresh clears a model's caches and unloads Direct Lake columns, so a recently refreshed "
                         "model starts colder.", False))
         for k in M["refresh"]["refreshed"]:
+            kept = M["refresh"]["guard"][k]["kept"]
             notes.append((f"{LBL[k]} was refreshed / reframed during the test (at {rb[k]['after']} UTC): its queries after "
-                          "that moment ran with cleared caches. For a clean comparison, re-run at a time without refreshes.", True))
+                          "that moment ran with cleared caches. "
+                          + (f"Round {_join_list(kept)} overlapped a refresh in every attempt ({MAX_ROUND_REPEATS} repeats); "
+                             "the last attempt is in the statistics. " if kept else "")
+                          + "For a clean comparison, re-run at a time without refreshes.", True))
+        for k in M["refresh"]["handled"]:
+            gk = M["refresh"]["guard"][k]
+            n_rep = gk["repeated"]
+            notes.append((f"{LBL[k]} was refreshed / reframed during the test (last at {rb[k]['after']} UTC). The refresh "
+                          "guard warmed it up again before measuring further"
+                          + (f" and repeated {n_rep} load round{'s' if n_rep > 1 else ''} that overlapped a refresh (the "
+                             "discarded attempts aren't in the statistics)" if n_rep else "") + "."
+                          + (" Its first-run (warm-up) times may include the refresh." if gk["in_warmup"] else "")
+                          + (" Its server cost (Step 6) may include queries that ran after the refresh." if gk["in_trace"]
+                             else ""), gk["in_trace"]))
     if M["capacity"] is True:
         notes.append(("Both workspaces ran on the same capacity; rounds alternated A,B / B,A to cancel drift.", False))
     elif M["capacity"] is False:
@@ -3386,7 +3560,11 @@ def render_report(M):
           f"{M['n_q']} queries replayed per virtual user | concurrency levels {esc(str(params.get('concurrency_levels', '')))} | "
           f"iterations {params.get('iterations', '')} | {esc(replay)} | rounds alternate A,B / B,A | "
           f"executions: load {len(M['load_all']):,}, warm-up {int((ex['phase'] == 'warmup').sum()):,}, "
-          f"trace {int((ex['phase'] == 'trace').sum()):,}</div></div>"))
+          f"trace {int((ex['phase'] == 'trace').sum()):,}"
+          + "".join(f", {lbl} {int((ex['phase'] == ph).sum()):,}"
+                    for ph, lbl in (("rewarm", "re-warm"), ("load_discarded", "discarded (refresh)"))
+                    if (ex["phase"] == ph).any())
+          + "</div></div>"))
 
     # ---------- 2. executive summary (+ the number check when it found differences) ----------
     try:
@@ -3778,7 +3956,7 @@ def _text_summary(M):
         print("trace matched: " + ", ".join(f"{LBL[k]} {m}/{t}" for k, (m, t) in M["trace"].items()))
 
     _h("Model state")
-    for t in ("first_touch_ms", "last_refresh_utc", "capacity_id"):
+    for t in ("first_touch_ms", "last_refresh_utc", "refresh_guard", "capacity_id"):
         for _, r in prof[prof["item_type"] == t].sort_values(["captured_utc", "model_key"]).iterrows():
             v = r["value_text"] if not _isnan(r["value_text"]) else fmt_ms(r["value_num"])
             print(f"{t:<18} {r['model_label']:<10} {str(r['item_name']):<26} {v}")
