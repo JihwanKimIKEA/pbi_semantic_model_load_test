@@ -16,7 +16,7 @@
 # 2. **Setup**: loads the helper code and finds the lakehouse.
 # 3. **Preflight**: validates parameters, detects the run mode, prints the approval fingerprint, checks the scheduled-run gates, parses the query file, connects to both models (first-touch time), compares model definitions and estimates the duration. Nothing heavy runs until `confirm_run = True` (or a scheduled run passes its gates).
 # 4. **Warm-up + result comparison**: every query once per model (first-run latency, row count, result checksum), then rows per table.
-# 5. **Number check**: the measures the report uses, compared in both models under a controlled filter (a few random business units, a 10-day window both models have loaded), so refresh timing can't explain a difference. A difference is flagged as CRITICAL with its likely cause; the run continues. Also runs in the dry run.
+# 5. **Number check**: the measures the report uses, compared in both models under a controlled filter (a few random business units, a 10-day window that ends a week before the latest date both models have loaded, so late-arriving data has settled), so refresh timing can't explain a difference. A difference is flagged as CRITICAL with its likely cause; the run continues. Also runs in the dry run.
 # 6. **Server cost**: both models are traced at the same time while the queries alternate A,B / B,A (single user, best effort), so both are measured under the same conditions: server duration and CPU per query.
 # 7. **Load test**: for every concurrency level and iteration, alternating rounds A,B -> B,A -> ...; each virtual user clicks through the report like a person: the queries of one click run in parallel as captured, with a think time between clicks.
 # 8. **Report**: starts with an **executive summary** for decision makers (blockers, trust checks, bottom line, pros, cons, trade-offs, questions, next steps, copy-as-text), then one chart: how long a user waits after each click. Everything else (number check, scorecard, server CPU per query, a plain per-visual table, errors, data-quality notes) is in one collapsed **Details for analysts** section. After a dry run: the approval summary. The report is also saved to `Files/LoadTest/Reports/`.
@@ -76,7 +76,8 @@ run_load_test = True                # Step 7: load test
 
 # ---- Number check (Step 5) -------------------------------------------------------
 number_check_bu_count = 3           # random business units, chosen from those with data in the window in both models
-number_check_days = 10              # window length; it ends one day before the latest date both models have loaded
+number_check_days = 10              # window length (days)
+number_check_end_offset_days = 7    # the window ends this many days before the latest date both models have loaded (the newest days may still be loading)
 number_check_tolerance_pct = 0.0001 # relative difference (%) still counted as equal; text values must match exactly
 number_check_seed = 0               # 0 = new random pick (the seed is printed and saved); a saved seed repeats a pick
 number_check_bu_column = ""         # "" = auto-detect; or e.g. "'Business Unit'[Business Unit]"
@@ -148,14 +149,14 @@ PARAM_NAMES = [
     "iterations", "think_time_between_actions_sec",
     "cooldown_between_rounds_sec", "ramp_up_sec", "query_timeout_sec", "run_warmup", "compare_results",
     "checksum_float_decimals", "run_number_check", "run_server_trace", "run_load_test",
-    "number_check_bu_count", "number_check_days", "number_check_tolerance_pct", "number_check_seed",
-    "number_check_bu_column", "number_check_date_column", "confirm_run", "max_concurrency_guard",
+    "number_check_bu_count", "number_check_days", "number_check_end_offset_days", "number_check_tolerance_pct",
+    "number_check_seed", "number_check_bu_column", "number_check_date_column", "confirm_run", "max_concurrency_guard",
     "max_concurrent_queries_guard", "noise_band_pct", "top_n_queries", "app_name",
     "run_mode", "schedule_approval", "schedule_window", "schedule_timezone", "schedule_min_minutes_since_refresh",
     "warmup_passes", "save_report_files",
 ]
 # Settings that change the load on the models: a scheduled run needs an approval fingerprint of exactly these
-# (report-only settings and the number-check seed are left out; scheduled runs always warm up).
+# (report-only settings, the number-check seed and end offset are left out; scheduled runs always warm up).
 FINGERPRINT_PARAMS = [
     "a_workspace", "a_model", "b_workspace", "b_model", "include_user_actions", "concurrency_levels", "iterations",
     "think_time_between_actions_sec", "cooldown_between_rounds_sec", "ramp_up_sec", "query_timeout_sec", "warmup_passes",
@@ -1466,6 +1467,8 @@ if a_workspace.strip() == b_workspace.strip() and a_model.strip() == b_model.str
     _problems.append("Model A and model B are the same model.")
 if int(number_check_bu_count) < 1 or int(number_check_days) < 1:
     _problems.append("number_check_bu_count and number_check_days must be >= 1.")
+if int(number_check_end_offset_days) < 1:
+    _problems.append("number_check_end_offset_days must be >= 1 (the latest loaded date itself may be incomplete).")
 if float(number_check_tolerance_pct) < 0:
     _problems.append("number_check_tolerance_pct must be >= 0.")
 for _name in ("number_check_bu_column", "number_check_date_column"):
@@ -1837,7 +1840,7 @@ else:
 # CELL 9 | markdown | - | Step 5 heading
 # ==============================================================================
 # ## Step 5 - Number check
-# Compares the measures the report uses in both models under a controlled filter: a few random business units and a 10-day window that both models have loaded, so refresh timing can't explain a difference. A difference is flagged as CRITICAL with its likely cause; the run continues. Also runs in the dry run (shown, not saved).
+# Compares the measures the report uses in both models under a controlled filter: a few random business units and a 10-day window that ends a week before the latest date both models have loaded (`number_check_end_offset_days`), so refresh timing and late-arriving data can't explain a difference. A difference is flagged as CRITICAL with its likely cause; the run continues. Also runs in the dry run (shown, not saved).
 
 # ==============================================================================
 # CELL 10 | code | hidden | Step 5 - Number check (controlled filter)
@@ -2434,14 +2437,19 @@ def run_number_check_pass():
         if missing:
             return finish("skipped", f"{_join_list(missing)} has no rows in {_join_list(facts)}")
         anchor = min(latest["A"], latest["B"])
-        end = anchor - timedelta(days=1)
+        offset = int(number_check_end_offset_days)
+        gap = "one day" if offset == 1 else f"{offset} days"
+        end = anchor - timedelta(days=offset)
         start = end - timedelta(days=int(number_check_days) - 1)
         cfg("anchor_date", anchor.isoformat())
-        cfg("anchor_rule", f"ends one day before {anchor}, the earlier of {A} {latest['A']} and {B} {latest['B']}; "
+        cfg("end_offset_days", num=offset)
+        cfg("anchor_rule", f"ends {gap} before {anchor}, the earlier of {A} {latest['A']} and {B} {latest['B']} "
+                           f"(number_check_end_offset_days: the newest days may still be loading); "
                            f"per model: {rule['A'] if rule['A'] == rule['B'] else rule['A'] + ' / ' + rule['B']}")
         cfg("window_start", start.isoformat())
         cfg("window_end", end.isoformat(), int(number_check_days))
-        print(f"Window: {start} to {end} (ends one day before {anchor}, the latest date both models have loaded)")
+        print(f"Window: {start} to {end} (ends {gap} before {anchor}, the latest date both models have loaded; "
+              f"number_check_end_offset_days = {offset})")
         ctx = {"date_col": date["ref"], "bu_col": bu["ref"], "start": start, "end": end, "bus": []}
 
         # 4. a few random business units with data in the window
@@ -2456,7 +2464,8 @@ def run_number_check_pass():
         cfg("bu_candidates", num=n_cand)
         cfg("bus", json.dumps(bus, ensure_ascii=False, default=str), len(bus))
         if not bus:
-            return finish("skipped", f"no business unit has rows from {start} to {end} in both models")
+            return finish("skipped", f"no business unit has rows from {start} to {end} in both models "
+                                     "(lower number_check_end_offset_days or number_check_days)")
         ctx["bus"] = bus
         print(f"Business units: {_join_list(bus, 10)} (random {len(bus)} of {n_cand} with rows in both models; seed {seed})")
 

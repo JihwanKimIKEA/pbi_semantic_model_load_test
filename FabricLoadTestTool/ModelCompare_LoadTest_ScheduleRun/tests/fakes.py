@@ -126,6 +126,10 @@ class FakeModel:
         self.refreshed = (now - timedelta(hours=6)) if key == "A" else datetime.combine(
             self.last_day + timedelta(days=1), datetime.min.time()) + timedelta(hours=4)
         self.sales = base[base["Date"] <= self.last_day].reset_index(drop=True)
+        if key == "B":   # late-arriving data: the newest days of the snapshot miss the last row per business unit and day
+            recent = self.sales["Date"] > self.last_day - timedelta(days=TRUTH["b_unsettled_days"])
+            last_row = ~self.sales.duplicated(["Date", "BU"], keep="last")
+            self.sales = self.sales[~(recent & last_row)].reset_index(drop=True)
         first = base["Date"].min()
         self.dates = [first + timedelta(days=i) for i in range((date(now.year, 12, 31) - first).days + 1)]
         self.measure_fn = _measures(changed=(key == "B"))

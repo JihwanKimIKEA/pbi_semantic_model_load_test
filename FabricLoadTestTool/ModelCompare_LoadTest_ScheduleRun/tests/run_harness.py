@@ -64,6 +64,9 @@ def _utc_hhmm(minutes):
 SCENARIOS = {
     "dry_run": {"overrides": {"confirm_run": False},
                 "about": "confirm_run = False: preflight + number check + approval summary; nothing may be written"},
+    "numcheck_old_window": {"overrides": {"confirm_run": False, "number_check_end_offset_days": 1},
+                            "about": "dry run with the window ending one day before the latest loaded date: it includes "
+                                     "B's partly loaded newest days, so a measure with the same definition differs too"},
     "confirmed": {"overrides": {"confirm_run": True},
                   "about": "confirm_run = True: the full test, then report, history and text summary"},
     "reopen_by_id": {"overrides": {"confirm_run": False}, "lake_from": "confirmed", "report_from": "confirmed",
@@ -99,7 +102,7 @@ SCENARIOS = {
                      "about": "pipeline run, approved, inside the window: the full test (warm-up forced on), report + "
                               "text + result files saved, exit JSON, trend line vs 5 seeded earlier runs"},
 }
-ORDER = ["dry_run", "confirmed", "reopen_by_id", "reopen_legacy", "interrupted_load", "load_issues",
+ORDER = ["dry_run", "numcheck_old_window", "confirmed", "reopen_by_id", "reopen_legacy", "interrupted_load", "load_issues",
          "scheduled_bad_fingerprint", "scheduled_outside_window", "scheduled_locked", "scheduled_unreachable_model",
          "scheduled_ok"]
 
@@ -486,6 +489,28 @@ def _trust_failing(M):
     return [t["name"] for t in M["trust"] if not t["ok"]]
 
 
+def _iso_date(v):
+    try:
+        return datetime.strptime(str(v)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _numcheck_window_checks(NC, offset):
+    """The window ends `offset` days before the anchor, so B's partly loaded newest days (late-arriving data) are outside
+    it and only the changed measure and its dependent differ."""
+    from synthetic_capture import TRUTH
+    anchor, end = (_iso_date(NC["anchor"]), _iso_date(NC["end"])) if NC else (None, None)
+    unsettled = TRUTH["b_unsettled_days"]
+    want = {TRUTH["changed_measure"], TRUTH["dependent_measure"]}
+    return [(f"number-check window ends number_check_end_offset_days ({offset}) before the latest date both models have "
+             f"loaded, so B's {unsettled} partly loaded newest days are outside it",
+             bool(anchor and end) and end == anchor - timedelta(days=offset) and end <= anchor - timedelta(days=unsettled),
+             f"anchor {NC and NC['anchor']}; window {NC and NC['start']} to {NC and NC['end']}"),
+            ("number check flags only the changed measure and its dependent (late-arriving rows are not flagged)",
+             bool(NC) and set(NC["flagged"]) == want, f"flagged {NC and NC['flagged']}")]
+
+
 def _truth_checks(M, ns):
     """The injected truth of the clean scenarios (confirmed / reopened)."""
     from synthetic_capture import TRUTH, VISUAL_BY_ID
@@ -507,13 +532,14 @@ def _truth_checks(M, ns):
     out.append((f"number check flags the changed measure [{m}] as CRITICAL with cause logic_changed",
                 bool(NC) and NC["status"] == "differences" and m in NC["flagged"] and "logic_changed" in causes,
                 f"status {NC and NC['status']}, flagged {NC and NC['flagged']}, causes {causes}"))
+    out += _numcheck_window_checks(NC, int(ns["number_check_end_offset_days"]))
     S = ns["summary_sections"](M)
     nc_blk = [b for b in S["blockers"] if b[0].startswith("Numbers differ")]
     out.append((f"Blockers: the number-check headline names [{m}] and its sub-lines are hidden in HTML (table below)",
                 bool(nc_blk) and f"[{m}]" in nc_blk[0][0] and nc_blk[0][2] is True, nc_blk[0][0][:160] if nc_blk else "none"))
     gap = M["refresh_gap_days"]
     names = [t["name"] for t in M["trust"]]
-    out.append(("staler refresh of B is in the Data line (not a trust check); data volume (x0.93 < 10%) passes",
+    out.append(("staler refresh of B is in the Data line (not a trust check); data volume (x0.92 < 10%) passes",
                 gap == gap and gap > 5 and "older in Branch" in S["fresh"] and "data age" not in names
                 and "data volume" in names and "data volume" not in _trust_failing(M), f"gap {gap:.1f} days; " + S["fresh"]))
     out.append(("trust check 'round pairs' replaces 'samples' (2 pairs per level with iterations = 2)",
@@ -600,7 +626,24 @@ def checks_dry_run(ctx):
              "the instruction", all(x in tail for x in ("rounds", "guard", "Duration", "CRITICAL", f'schedule_approval = "{fp}"',
                                                         "confirm_run = True")), tail[:120].replace("\n", " | ")),
             ("Step 3 no longer tells the user to set confirm_run = True before the number check",
-             "then set confirm_run = True and run again" not in text, "")]
+             "then set confirm_run = True and run again" not in text, "")] + _numcheck_window_checks(
+                NC, int(ns["number_check_end_offset_days"]))
+
+
+def checks_numcheck_old_window(ctx):
+    ns = ctx["ns"]
+    NC = ns.get("NUMCHECK")
+    late = "Total Sales"   # same definition in both models: it can only differ through the rows in the window
+    causes = [c for c, _ in (NC or {}).get("causes", {}).get(late, [])]
+    anchor, end = (_iso_date(NC["anchor"]), _iso_date(NC["end"])) if NC else (None, None)
+    return [_cells_ok(ctx), _engine_ok(ctx),
+            ("window ends one day before the latest date both models have loaded (number_check_end_offset_days = 1)",
+             bool(anchor and end) and end == anchor - timedelta(days=1),
+             f"anchor {NC and NC['anchor']}; window {NC and NC['start']} to {NC and NC['end']}"),
+            (f"B's partly loaded newest days are inside this window: [{late}] is flagged, with cause rows_differ only",
+             bool(NC) and late in NC["flagged"] and causes == ["rows_differ"], f"flagged {NC and NC['flagged']}; causes {causes}"),
+            ("the window rule names the offset parameter", bool(NC) and "number_check_end_offset_days" in (NC["anchor_rule"] or "")
+             and "ends one day before" in (NC["anchor_rule"] or ""), (NC and NC["anchor_rule"] or "")[:200])]
 
 
 def checks_confirmed(ctx):
@@ -857,7 +900,8 @@ def notes_interrupted(ctx):
 
 
 NOTES = {"interrupted_load": notes_interrupted}
-CHECKS = {"dry_run": checks_dry_run, "confirmed": checks_confirmed, "reopen_by_id": checks_reopen_by_id,
+CHECKS = {"dry_run": checks_dry_run, "numcheck_old_window": checks_numcheck_old_window, "confirmed": checks_confirmed,
+          "reopen_by_id": checks_reopen_by_id,
           "reopen_legacy": checks_reopen_legacy, "interrupted_load": checks_interrupted, "load_issues": checks_load_issues,
           "scheduled_bad_fingerprint": checks_bad_fp, "scheduled_outside_window": checks_outside,
           "scheduled_locked": checks_locked, "scheduled_unreachable_model": checks_unreachable,

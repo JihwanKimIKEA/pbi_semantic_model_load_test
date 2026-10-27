@@ -9,7 +9,8 @@ Every query starts with a "// vis:<id>" comment, so the fake engine knows which 
 TRUTH is the single place for what the harness injects into model B (the candidate):
   - one visual clearly slower in B, one clearly faster in B (latency and server CPU),
   - one changed measure ([Margin]; [Margin %] depends on it),
-  - a staler refresh and slightly fewer rows (B's data ends 9 days earlier).
+  - a staler refresh and slightly fewer rows (B's data ends 9 days earlier),
+  - late-arriving data: B's newest days are only partly loaded (the number-check window must end before them).
 """
 import json
 import sys
@@ -23,6 +24,7 @@ TRUTH = {
     "dependent_measure": "Margin %",
     "a_data_lag_days": 1,           # A: last date with data = today - 1, refreshed ~6 h ago
     "b_data_lag_days": 10,          # B: last date with data = today - 10, refreshed 10 days ago (staler, fewer rows)
+    "b_unsettled_days": 3,          # B: its 3 newest days miss one row per business unit and day (late-arriving data)
     "slow_click": 1,                # the click that contains the slow visual
     "fast_click": 3,                # the click that contains the fast visual
 }
