@@ -1,12 +1,11 @@
-# ModelCompare_LoadTest
-
+# ModelCompare_LoadTest_ScheduleRun
 An A/B load test for two Fabric / Power BI semantic models, for example **production** against a **feature-branch workspace**. It needs one lakehouse and one Python notebook.
 
 The notebook replays the DAX queries you captured with **Power BI Performance Analyzer** against both models. It generates the load itself as soon as you run it; it does not wait for real users. The result is a side-by-side report of speed, stability, server cost and result differences, plus the trade-offs (definition changes, data volume). A **number check** compares the measures the report uses under a controlled filter, so a difference caused by refresh timing can be told apart from a real one. It doesn't give a merge verdict; the decision is yours.
 
 It builds on [RunLoadTest / RunPerfScenario](../readme.md) (same ADOMD.NET replay technique) and adds:
 
-| | RunLoadTest + RunPerfScenario | ModelCompare_LoadTest |
+| | RunLoadTest + RunPerfScenario | ModelCompare_LoadTest_ScheduleRun |
 |---|---|---|
 | Models per run | 1 | 2 (A = baseline, B = candidate), alternating rounds A,B / B,A |
 | Artifacts | 2 notebooks | 1 notebook (virtual users are Python threads, each with its own connections) |
@@ -22,8 +21,8 @@ It builds on [RunLoadTest / RunPerfScenario](../readme.md) (same ADOMD.NET repla
 
 | File | Use |
 |---|---|
-| [ModelCompare_LoadTest.py](./ModelCompare_LoadTest.py) | Source with `# CELL n` markers: the guide, then a Markdown heading and a code block for each of the 10 steps. |
-| [ModelCompare_LoadTest.ipynb](./ModelCompare_LoadTest.ipynb) | Same cells as an importable Fabric Python notebook, generated from the `.py`. The parameter cell is already tagged, and the code of Steps 2–10 is hidden, so you see only the results. |
+| [ModelCompare_LoadTest_ScheduleRun.py](./ModelCompare_LoadTest_ScheduleRun.py) | Source with `# CELL n` markers: the guide, then a Markdown heading and a code block for each of the 10 steps. |
+| [ModelCompare_LoadTest_ScheduleRun.ipynb](./ModelCompare_LoadTest_ScheduleRun.ipynb) | Same cells as an importable Fabric Python notebook, generated from the `.py`. The parameter cell is already tagged, and the code of Steps 2–10 is hidden, so you see only the results. |
 | [build_notebook.py](./build_notebook.py) | Regenerates the `.ipynb` from the `.py` (see [Maintainers](#maintainers)). |
 | [tests/](./tests/) | Offline test harness (fake Fabric, fake models, synthetic capture); not needed in Fabric (see [Maintainers](#maintainers)). |
 
@@ -31,7 +30,7 @@ It builds on [RunLoadTest / RunPerfScenario](../readme.md) (same ADOMD.NET repla
 
 1. **Workspace**: any workspace on a Fabric capacity. A dedicated workspace is recommended so the tooling stays out of production and Git-synced branch workspaces.
 2. **Lakehouse**: create `lh_loadtest` (any name; see `lakehouse_name`). Create the folder `Files/LoadTest/Queries/` and upload your `PowerBIPerformanceData.json`. Later query files go to the same folder.
-3. **Notebook**: create a notebook named `ModelCompare_LoadTest` and set its language to **Python** (not PySpark).
+3. **Notebook**: create a notebook named `ModelCompare_LoadTest_ScheduleRun` and set its language to **Python** (not PySpark).
    - Import the `.ipynb` (recommended), or create 21 cells and paste the blocks from the `.py` in order: a Markdown guide, then for each step a Markdown heading and a code cell. If you paste, hide the code yourself: on each code cell except Parameters, cell `...` menu > *Hide input*.
    - The Parameters code cell (Step 1) must be the parameter cell (cell `...` menu > *Toggle parameter cell*; already set in the `.ipynb`) so pipelines can pass parameters.
    - Attaching the lakehouse is optional: the notebook resolves `host_workspace` + `lakehouse_name` itself.
@@ -275,7 +274,7 @@ The number check is stored in `lt_model_profile` with these `item_type` values (
 The `.py` is the source of truth. After editing it, regenerate the notebook and check that both are in sync:
 
 ```
-python build_notebook.py          # writes ModelCompare_LoadTest.ipynb (keeps the cell ids)
+python build_notebook.py          # writes ModelCompare_LoadTest_ScheduleRun.ipynb (keeps the cell ids)
 python build_notebook.py --check  # exit code 1 if the .ipynb is out of sync
 ```
 

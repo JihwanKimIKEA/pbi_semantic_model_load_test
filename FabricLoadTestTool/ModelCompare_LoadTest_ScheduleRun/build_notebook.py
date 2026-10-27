@@ -1,8 +1,8 @@
-"""Generate ModelCompare_LoadTest.ipynb from ModelCompare_LoadTest.py.
+"""Generate ModelCompare_LoadTest_ScheduleRun.ipynb from ModelCompare_LoadTest_ScheduleRun.py.
 
 The .py file is the source of truth. Edit it, then regenerate the notebook:
 
-    python build_notebook.py            # (re)writes ModelCompare_LoadTest.ipynb
+    python build_notebook.py            # (re)writes ModelCompare_LoadTest_ScheduleRun.ipynb
     python build_notebook.py --check    # exit 1 if the .ipynb is out of sync
 
 --py PATH / --ipynb PATH override the default files next to this script.
@@ -164,10 +164,10 @@ def first_difference(new, old, cells):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Generate the .ipynb from the .py (the source of truth).")
-    ap.add_argument("--py", type=Path, metavar="PATH", default=HERE / "ModelCompare_LoadTest.py",
-                    help="source .py (default: ModelCompare_LoadTest.py next to this script)")
-    ap.add_argument("--ipynb", type=Path, metavar="PATH", default=HERE / "ModelCompare_LoadTest.ipynb",
-                    help="notebook to write/check (default: ModelCompare_LoadTest.ipynb next to this script)")
+    ap.add_argument("--py", type=Path, metavar="PATH", default=HERE / "ModelCompare_LoadTest_ScheduleRun.py",
+                    help="source .py (default: ModelCompare_LoadTest_ScheduleRun.py next to this script)")
+    ap.add_argument("--ipynb", type=Path, metavar="PATH", default=HERE / "ModelCompare_LoadTest_ScheduleRun.ipynb",
+                    help="notebook to write/check (default: ModelCompare_LoadTest_ScheduleRun.ipynb next to this script)")
     ap.add_argument("--check", action="store_true", help="only compare; exit 1 if out of sync")
     args = ap.parse_args(argv)
 

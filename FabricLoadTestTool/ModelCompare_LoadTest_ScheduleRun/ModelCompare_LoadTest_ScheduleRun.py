@@ -1,7 +1,7 @@
 # ==============================================================================
 # CELL 0 | markdown | - | Guide
 # ==============================================================================
-# # ModelCompare_LoadTest - A/B load test of two semantic models
+# # ModelCompare_LoadTest_ScheduleRun - A/B load test of two semantic models
 #
 # Replays the DAX queries captured with **Power BI Performance Analyzer** against two semantic models
 # (**A** = baseline, e.g. production; **B** = candidate, e.g. a feature-branch workspace) and shows a clear,

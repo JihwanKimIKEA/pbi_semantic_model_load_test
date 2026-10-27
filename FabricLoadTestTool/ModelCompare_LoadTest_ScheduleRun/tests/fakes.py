@@ -797,7 +797,7 @@ def install(engine, lakehouse_dir, host_workspace="Harness Host", context=None):
     def exit_(value=None):
         raise NotebookExit(value)
     ctx = {"currentWorkspaceId": host_id, "currentWorkspaceName": host_workspace,
-           "currentNotebookName": "ModelCompare_LoadTest", "currentNotebookId": _guid("notebook"),
+           "currentNotebookName": "ModelCompare_LoadTest_ScheduleRun", "currentNotebookId": _guid("notebook"),
            "isForPipeline": False, "isReferenceRun": False, "currentRunId": None, "productType": "Fabric"}
     ctx.update(context or {})
     nbu = types.SimpleNamespace(

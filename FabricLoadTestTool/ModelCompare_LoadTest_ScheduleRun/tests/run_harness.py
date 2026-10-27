@@ -1,4 +1,4 @@
-"""Offline harness: runs ModelCompare_LoadTest.py cell by cell against the fakes (tests/fakes.py), like "Run all" in
+"""Offline harness: runs ModelCompare_LoadTest_ScheduleRun.py cell by cell against the fakes (tests/fakes.py), like "Run all" in
 Fabric, and checks the outputs against the injected truth (tests/synthetic_capture.py).
 
     python tests/run_harness.py --all --out <folder>                 # build check + every scenario
@@ -39,7 +39,7 @@ sys.dont_write_bytecode = True   # no __pycache__ in the repo
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"   # ... nor from the scenario subprocesses
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-NOTEBOOK_PY = os.path.join(ROOT, "ModelCompare_LoadTest.py")
+NOTEBOOK_PY = os.path.join(ROOT, "ModelCompare_LoadTest_ScheduleRun.py")
 TABLES = ["lt_comparison", "lt_query_catalog", "lt_model_profile", "lt_executions", "lt_server_metrics", "lt_result_compare",
           "lt_run_summary"]
 QUERY_FILE = "Files/LoadTest/Queries/PowerBIPerformanceData.json"
